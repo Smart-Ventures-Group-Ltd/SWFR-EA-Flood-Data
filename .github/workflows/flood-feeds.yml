@@ -61,6 +61,7 @@ jobs:
         env:
           TAKOS_MCP_URL: https://live.gotak.dev/api/mcp
           TAKOS_MISSION_ID: b8a434af-ad21-4e7e-bd32-724f1e9220d8
+          TAKOS_TEAM_ID: f10187df-0a48-49ec-a7b5-27ebb9b38a47
           CENTRE_LAT: "52.192"
           CENTRE_LON: "-2.22"
           RADIUS_KM: "35"
