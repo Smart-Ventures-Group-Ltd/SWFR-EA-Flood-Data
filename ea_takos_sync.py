@@ -35,6 +35,13 @@ DRY = os.environ.get("DRY_RUN") == "1"
 NS = uuid.UUID("6f1d3c2a-5b8e-4f7a-9c1d-2e3f4a5b6c7d")
 TAG = "[EA-FEED]"
 REFRESH_HOURS = 12  # re-send unchanged items so they never go stale on devices (CoT stale = 24 h)
+LEVEL_STEP_M = 0.05  # re-send a gauge when its level moves at least this much
+TIME_BUDGET_S = int(os.environ.get("TIME_BUDGET_S", "720"))  # stop starting new items after 12 min
+STATE_FILE = os.environ.get("STATE_FILE", "state/ea_state.json")
+CONFIRM_GAP_S = 6.3  # GoTAK: 10 confirmed calls per minute
+MUTATE_GAP_S = 3.2   # GoTAK: 20 mutating calls per minute
+MUTATING = {"create_map_object", "update_map_object", "attach_map_object_to_mission",
+            "share_map_object", "detach_map_object_from_mission", "delete_map_object"}
 SIMPLIFY_DEG = 0.00015  # roughly 10-15 m; invisible at map scale
 
 COL = {"high": "#FF0000", "normal": "#2E8BFF", "low": "#FFD700", "unknown": "#FFFFFF", "none": "#808080"}
@@ -94,7 +101,35 @@ class MCP:
                                 "clientInfo": {"name": "swfr-ea-sync", "version": "1.0"}})
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, expect_reply=False)
 
+    _last = {"confirm": 0.0, "mutate": 0.0}
+
+    def _pace(self, tool, args):
+        now = time.monotonic()
+        if "confirm_token" in args:
+            wait = self._last["confirm"] + CONFIRM_GAP_S - now
+        elif tool in MUTATING:
+            wait = self._last["mutate"] + MUTATE_GAP_S - now
+        else:
+            wait = 0
+        if wait > 0:
+            time.sleep(wait)
+        if "confirm_token" in args:
+            self._last["confirm"] = time.monotonic()
+        if tool in MUTATING:
+            self._last["mutate"] = time.monotonic()
+
     def call(self, tool, args):
+        for attempt in range(5):
+            self._pace(tool, args)
+            text, data, err = self._call_once(tool, args)
+            m = re.search(r"Rate limit exceeded.*?Retry in (\d+)s", text)
+            if err and m:
+                time.sleep(int(m.group(1)) + 1)
+                continue
+            return text, data, err
+        return text, data, err
+
+    def _call_once(self, tool, args):
         res = self.rpc("tools/call", {"name": tool, "arguments": args})
         text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
         data = res.get("structuredContent")
@@ -108,6 +143,13 @@ class MCP:
         return text, data or {}, bool(res.get("isError"))
 
     def call_confirmed(self, tool, args):
+        for attempt in range(3):
+            data = self._confirmed_once(tool, args)
+            if data is not None:
+                return data
+        raise RuntimeError(f"{tool} failed after retries")
+
+    def _confirmed_once(self, tool, args):
         text, data, err = self.call(tool, args)
         token = data.get("confirm_token")
         if not token:
@@ -115,6 +157,8 @@ class MCP:
             token = m.group(1) if m else None
         if token and ("confirmation" in text.lower() or data.get("status") == "confirmation_required"):
             text, data, err = self.call(tool, {**args, "confirm_token": token})
+            if err and re.search(r"token|expired|voided", text, re.I):
+                return None  # token lost to a delay; start the confirmation again
         if err:
             raise RuntimeError(f"{tool} failed: {text[:300]}")
         return data
@@ -179,23 +223,34 @@ def gauge_items():
             else:
                 state = "unknown"
             if t and (ea.now_utc() - t).total_seconds() > ea.STALE_MINUTES * 60:
-                age = ea.age_text(t)
+                age = uk_time(t)
         name = label if v is None else f"{label} {v:.2f}m{tag}"
         if age:
-            name += f" ({age} old)"
+            name += f" @{age}"
         status = {"high": "ABOVE typical range", "low": "Below typical range", "normal": "Within typical range",
                   "unknown": "No typical range published", "none": "No reading in the last ~4 weeks"}[state]
         remarks = (f"{TAG}gauge\nEA river gauge: {label}\nRiver: {s.get('riverName', '')}\n"
                    f"Level: {'n/a' if v is None else f'{v:.2f} {unit}'}\nStatus: {status}\n"
                    f"Typical range: {lo} to {hi}\nHighest recent: {rec}\n"
-                   f"Reading: {when or 'n/a'}{f' ({age} old)' if age else ''}\n"
+                   f"Reading: {when or 'n/a'}{' (no newer reading available)' if age else ''}\n"
                    f"https://check-for-flooding.service.gov.uk/station/{s.get('RLOIid', '')}\n"
                    "Source: Environment Agency real-time API (beta), OGL v3. Not for safety-critical use.")
         items.append({"id": oid("gauge", ref), "feature": {
             "name": name, "kind": "marker", "cot_type": "b-m-p-s-m", "color": COL[state],
             "geometry": {"type": "Point", "coordinates": [round(float(lon), 5), round(float(lat), 5)]},
-            "remarks": remarks}})
+            "remarks": remarks},
+            "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when}})
     return items
+
+
+def uk_time(t):
+    try:
+        from zoneinfo import ZoneInfo
+        lt = t.astimezone(ZoneInfo("Europe/London"))
+    except Exception:
+        lt = t
+    today = ea.now_utc().astimezone(lt.tzinfo).date()
+    return lt.strftime("%H:%M") if lt.date() == today else lt.strftime("%d %b %H:%M")
 
 
 def warning_items():
@@ -228,7 +283,9 @@ def warning_items():
                 "name": f"{label}: {f.get('description', '')}" + (f" ({i + 1})" if i else ""),
                 "kind": "polygon", "color": colour, "fill_color": colour, "fill_opacity": opacity,
                 "stroke_width": 3, "geometry": {"type": "Polygon", "coordinates": [simplify(ring)]},
-                "remarks": remarks}})
+                "remarks": remarks},
+                "meta": {"kind": "warning", "level": lvl, "code": code,
+                         "msg_changed": f.get("timeMessageChanged", "")}})
     return items
 
 
@@ -261,84 +318,136 @@ def publish(mcp, ident, rev):
     share(mcp, ident, rev)
 
 
-def upsert(mcp, item, stats):
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, STATE_FILE)
+
+
+def priority(item, prev):
+    """None if no send is needed, else a sort key (lower = sooner)."""
+    m = item["meta"]
+    if not prev:
+        return (1 if m["kind"] == "warning" else 3, 0)
+    if m["kind"] == "warning":
+        if prev.get("level") != m["level"] or prev.get("msg_changed") != m["msg_changed"] or not prev.get("active"):
+            return (0, 0)
+    else:
+        if prev.get("state") != m["state"] or prev.get("stale") != m["stale"]:
+            return (2, 0)
+        a, b = prev.get("level"), m["level"]
+        if a is not None and b is not None and abs(a - b) >= LEVEL_STEP_M:
+            return (2, -abs(a - b))
+        if (a is None) != (b is None):
+            return (2, 0)
+    sent = ea.parse_time(prev.get("sent", "") or "")
+    if not sent or (ea.now_utc() - sent).total_seconds() > REFRESH_HOURS * 3600:
+        return (4, 0)
+    return None
+
+
+def publish_item(mcp, item):
     ident, feat = item["id"], item["feature"]
     text, cur, err = mcp.call("get_map_object", {"id": ident})
     exists = not err and cur.get("id") == ident and not cur.get("deleted")
     if not exists:
-        _, res, err = mcp.call("create_map_object", {"operation_id": ident, "feature": feat})
+        text, res, err = mcp.call("create_map_object", {"operation_id": ident, "feature": feat})
         if err or res.get("id") != ident:
-            raise RuntimeError(f"create failed for {feat['name']}: {res}")
-        publish(mcp, ident, res["revision"])
-        stats["created"] += 1
-        return
-    if same(cur, feat) and fresh(cur):
-        stats["unchanged"] += 1
-        return
-    _, res, err = mcp.call("update_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
-                                                 "expected_revision": cur["revision"], "feature": feat})
-    if err or "revision" not in res:
-        raise RuntimeError(f"update failed for {feat['name']}: {res}")
-    publish(mcp, ident, res["revision"])
-    stats["updated"] += 1
-
-
-def retire_warnings(mcp, active_ids, stats):
-    _, data, _ = mcp.call("list_map_objects", {})
-    objs = data.get("objects") or data.get("items") or data.get("map_objects") or []
-    for o in objs:
-        feat = o.get("feature", o)
-        remarks = feat.get("remarks", "") or ""
-        ident = o.get("id") or feat.get("id")
-        if not remarks.startswith(f"{TAG}warning\n") or ident in active_ids:
-            continue
-        cur = mcp.call("get_map_object", {"id": ident})[1]
-        cf = cur["feature"]
-        ended = {"name": "NO LONGER IN FORCE: " + cf.get("name", "").split(": ", 1)[-1], "kind": "polygon",
-                 "geometry": cf["geometry"], "color": "#808080", "fill_color": "#808080", "fill_opacity": 0.1,
-                 "stroke_width": 2, "stroke_style": "dashed",
-                 "remarks": f"{TAG}warning-ended\nEA warning no longer in force (seen ended "
-                            f"{ea.now_utc().strftime('%d %b %H:%M UTC')}). This shape expires from devices within 24 h.\n\n"
-                            + remarks.split("\n", 1)[-1]}
-        _, res, err = mcp.call("update_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
-                                                     "expected_revision": cur["revision"], "feature": ended})
+            raise RuntimeError(f"create failed: {text[:200]}")
+        rev, action = res["revision"], "created"
+    elif same(cur, feat):
+        rev, action = cur["revision"], "resent"
+    else:
+        text, res, err = mcp.call("update_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
+                                                        "expected_revision": cur["revision"], "feature": feat})
         if err or "revision" not in res:
-            raise RuntimeError(f"retire update failed for {ident}: {res}")
-        share(mcp, ident, res["revision"])
-        mcp.call_confirmed("detach_map_object_from_mission", {
-            "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": res["revision"],
-            "mission_id": MISSION})
-        stats["retired"] += 1
+            raise RuntimeError(f"update failed: {text[:200]}")
+        rev, action = res["revision"], "updated"
+    publish(mcp, ident, rev)
+    return action
+
+
+def retire(mcp, ident, prev):
+    cur = mcp.call("get_map_object", {"id": ident})[1]
+    cf = cur["feature"]
+    ended = {"name": "NO LONGER IN FORCE: " + cf.get("name", "").split(": ", 1)[-1], "kind": "polygon",
+             "geometry": cf["geometry"], "color": "#808080", "fill_color": "#808080", "fill_opacity": 0.1,
+             "stroke_width": 2, "stroke_style": "dashed",
+             "remarks": f"{TAG}warning-ended\nEA warning no longer in force (seen ended "
+                        f"{ea.now_utc().strftime('%d %b %H:%M UTC')}). This shape expires from devices within 24 h.\n\n"
+                        + (cf.get("remarks", "") or "").split("\n", 1)[-1]}
+    text, res, err = mcp.call("update_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
+                                                    "expected_revision": cur["revision"], "feature": ended})
+    if err or "revision" not in res:
+        raise RuntimeError(f"retire update failed: {text[:200]}")
+    share(mcp, ident, res["revision"])
+    mcp.call_confirmed("detach_map_object_from_mission", {
+        "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": res["revision"], "mission_id": MISSION})
 
 
 def main():
+    t0 = time.monotonic()
     gauges, warnings = gauge_items(), warning_items()
-    print(f"EA: {len(gauges)} gauges, {len(warnings)} warning shapes")
+    items = warnings + gauges
+    state = load_state()
+    queue = []
+    for it in items:
+        p = priority(it, state.get(it["id"]))
+        if p is not None:
+            queue.append((p, it))
+    queue.sort(key=lambda x: x[0])
+    active = {w["id"] for w in warnings}
+    ended = [i for i, v in state.items() if v.get("kind") == "warning" and v.get("active") and i not in active]
+    print(f"EA: {len(gauges)} gauges, {len(warnings)} warning shapes; {len(queue)} to send, {len(ended)} to retire")
     if DRY:
-        for it in (gauges[:5] + warnings[:3]):
-            f = it["feature"]
-            print(" ", it["id"], f["kind"], f.get("color"), "|", f["name"],
-                  f"| {len(f['geometry']['coordinates'][0])} pts" if f["kind"] == "polygon" else "")
+        for p, it in queue[:8]:
+            print(" ", p, it["feature"]["kind"], "|", it["feature"]["name"])
         return
     if not KEY:
         raise SystemExit("TAKOS_MCP_KEY is not set")
     mcp = MCP(URL, KEY)
     mcp.start()
-    stats = {"created": 0, "updated": 0, "unchanged": 0, "retired": 0, "failed": 0}
-    for item in warnings + gauges:
+    stats = {"created": 0, "updated": 0, "resent": 0, "retired": 0, "failed": 0, "deferred": 0}
+    for ident in ended:
+        if time.monotonic() - t0 > TIME_BUDGET_S:
+            stats["deferred"] += 1
+            continue
         try:
-            upsert(mcp, item, stats)
+            retire(mcp, ident, state[ident])
+            state[ident]["active"] = False
+            stats["retired"] += 1
+            save_state(state)
         except Exception as exc:
             stats["failed"] += 1
-            print(f"FAILED {item['feature']['name']}: {exc}", file=sys.stderr)
-    try:
-        retire_warnings(mcp, {w["id"] for w in warnings}, stats)
-    except Exception as exc:
-        print(f"retire step failed: {exc}", file=sys.stderr)
-        stats["failed"] += 1
+            print(f"FAILED retiring {ident}: {exc}", file=sys.stderr)
+    for p, it in queue:
+        if time.monotonic() - t0 > TIME_BUDGET_S:
+            stats["deferred"] += 1
+            continue
+        try:
+            action = publish_item(mcp, it)
+            stats[action] += 1
+            rec = dict(it["meta"])
+            rec.update({"sent": ea.now_utc().isoformat(), "active": True})
+            state[it["id"]] = rec
+            save_state(state)
+        except Exception as exc:
+            stats["failed"] += 1
+            print(f"FAILED {it['feature']['name']}: {exc}", file=sys.stderr)
+    save_state(state)
     print(json.dumps(stats))
-    total = len(gauges) + len(warnings)
-    if total and stats["failed"] > total // 2:
+    attempted = len(queue) + len(ended) - stats["deferred"]
+    if attempted and stats["failed"] > attempted // 2:
         sys.exit(1)
 
 
