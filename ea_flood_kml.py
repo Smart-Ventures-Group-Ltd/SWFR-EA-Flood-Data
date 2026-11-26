@@ -148,11 +148,35 @@ def parse_time(s):
         return None
 
 
+def age_text(t):
+    secs = (now_utc() - t).total_seconds()
+    if secs < 3600:
+        return f"{max(int(secs // 60), 0)} min"
+    if secs < 172800:
+        return f"{int(secs // 3600)} h"
+    return f"{int(secs // 86400)} d"
+
+
+def last_reading_fallback(station_ref):
+    """Most recent reading in the API's ~4-week history, for gauges missing from ?latest."""
+    try:
+        items = get(f"/id/stations/{station_ref}/readings?_sorted&_limit=10").get("items", [])
+    except Exception:
+        return None
+    for r in items:
+        if "level" in str(r.get("measure", "")):
+            return r
+    return None
+
+
 def levels_kml():
     stations = get(f"/id/stations?parameter=level&lat={LAT}&long={LON}&dist={DIST_KM:g}&_view=full").get("items", [])
     latest = latest_by_measure("level")
     styles = (style("high", "ff0000ff", scale=1.1) + style("normal", "ffff8000") +
-              style("low", "ff00c8ff") + style("stale", "ff808080", scale=0.8))
+              style("low", "ff00c8ff") + style("unknown", "ffffffff") +
+              style("high_old", "800000ff", scale=1.0) + style("normal_old", "80ff8000", scale=0.9) +
+              style("low_old", "8000c8ff", scale=0.9) + style("unknown_old", "80ffffff", scale=0.9) +
+              style("none", "ff808080", scale=0.8))
     body, count = [], 0
     for s in stations:
         lat, lon = s.get("lat"), s.get("long")
@@ -165,26 +189,38 @@ def levels_kml():
             r = latest.get(str(m.get("@id", "")).replace("http://", "https://", 1))
             if r and (reading is None or m.get("qualifier") == "Stage"):
                 reading, unit = r, m.get("unitName", "")
+            unit = unit or m.get("unitName", "")
+        if not reading and s.get("stationReference"):
+            reading = last_reading_fallback(s["stationReference"])
         scale = s.get("stageScale") if isinstance(s.get("stageScale"), dict) else {}
         lo, hi = scale.get("typicalRangeLow"), scale.get("typicalRangeHigh")
         rec = (scale.get("highestRecent") or {}).get("value")
-        sid, state = "stale", "No recent reading"
+        label = f"{s.get('label', s.get('stationReference', 'Gauge'))}"
+        sid, state, vtxt, when, age = "none", "No reading in the last ~4 weeks", "n/a", "", ""
         if reading:
             v = reading.get("value")
             v = v[0] if isinstance(v, list) else v
             t = parse_time(reading.get("dateTime", ""))
-            if t and (now_utc() - t).total_seconds() <= STALE_MINUTES * 60 and isinstance(v, (int, float)):
+            when = reading.get("dateTime", "")
+            if isinstance(v, (int, float)):
                 if hi is not None and v > hi:
                     sid, state = "high", "Above typical range"
                 elif lo is not None and v < lo:
                     sid, state = "low", "Below typical range"
+                elif hi is not None or lo is not None:
+                    sid, state = "normal", "Within typical range"
                 else:
-                    sid, state = "normal", "Within typical range" if hi is not None else "Reading (no typical range published)"
-            vtxt = f"{v} {unit}" if v is not None else "n/a"
-            when = reading.get("dateTime", "")
-        else:
-            vtxt, when = "n/a", ""
-        name = f"{s.get('label', s.get('stationReference', 'Gauge'))}"
+                    sid, state = "unknown", "No typical range published"
+                vtxt = f"{v:.2f} {unit}".strip()
+                old = not t or (now_utc() - t).total_seconds() > STALE_MINUTES * 60
+                if t:
+                    age = age_text(t)
+                if old:
+                    sid += "_old"
+                    state += f" (last reading {age} old)" if age else " (reading time unknown)"
+        name = f"{label} {vtxt}" if vtxt != "n/a" else label
+        if sid.endswith("_old") and age:
+            name += f" ({age} old)"
         river = s.get("riverName", "")
         desc = (f"<b>{escape(state)}</b><br/>River: {escape(str(river))}<br/>Level: {escape(vtxt)}<br/>"
                 f"Reading time: {escape(when)}<br/>Typical range: {lo} to {hi}<br/>Highest recent: {rec}<br/>"
@@ -207,15 +243,26 @@ def rainfall_kml():
             continue
         sref = s.get("stationReference", "")
         r = next((v for k, v in latest.items() if f"/{sref}-rainfall" in k), None)
-        sid, vtxt, when = "stale", "n/a", ""
+        sid, vtxt, when, age = "stale", "n/a", "", ""
+        lbl = str(s.get("label") or "")
+        name = f"Rain gauge {lbl if lbl and lbl.lower() != 'rainfall station' else sref}"
         if r:
             t = parse_time(r.get("dateTime", ""))
             val = r.get("value")
-            if t and (now_utc() - t).total_seconds() <= STALE_MINUTES * 60 and isinstance(val, (int, float)):
-                sid = "rainheavy" if val >= 2 else "rain"
-            vtxt, when = f"{val} mm in 15 min", r.get("dateTime", "")
-        desc = f"Rainfall: {escape(vtxt)}<br/>Reading time: {escape(when)}<br/>Station: {escape(sref)}<br/><i>{escape(ATTRIB)}</i>"
-        body.append(point(f"Rain gauge {s.get('label', sref)}", sid, float(lon), float(lat), desc))
+            when = r.get("dateTime", "")
+            if isinstance(val, (int, float)):
+                vtxt = f"{val} mm in 15 min"
+                name += f" {val} mm"
+                old = not t or (now_utc() - t).total_seconds() > STALE_MINUTES * 60
+                if t:
+                    age = age_text(t)
+                if old:
+                    name += f" ({age} old)" if age else ""
+                else:
+                    sid = "rainheavy" if val >= 2 else "rain"
+        desc = (f"Rainfall: {escape(vtxt)}<br/>Reading time: {escape(when)}"
+                f"{' (' + age + ' old)' if age else ''}<br/>Station: {escape(sref)}<br/><i>{escape(ATTRIB)}</i>")
+        body.append(point(name, sid, float(lon), float(lat), desc))
     return doc(f"EA Rainfall ({stamp()})", styles, "".join(body)), len(body)
 
 
