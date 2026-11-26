@@ -9,8 +9,12 @@ Environment:
   DRY_RUN=1         build items and print the plan without calling TAK OS
 
 Every object has a fixed id derived from its EA reference, so each run updates
-the same items. Ended warnings are detached from the mission and hidden, never
-deleted, so ids are never reused.
+the same items. Each new or changed item is attached to the mission (so devices
+that open or join Data Sync get the full picture) and also sent to the team as
+live CoT (so connected devices, including iTAK, update immediately). Ended
+warnings turn grey ("no longer in force"), are sent once, detached from the
+mission and left to expire on devices after 24 h. Objects are never deleted, so
+ids are never reused.
 """
 import json
 import os
@@ -26,6 +30,7 @@ import ea_flood_kml as ea
 URL = os.environ.get("TAKOS_MCP_URL", "https://live.gotak.dev/api/mcp")
 KEY = os.environ.get("TAKOS_MCP_KEY", "")
 MISSION = os.environ.get("TAKOS_MISSION_ID", "b8a434af-ad21-4e7e-bd32-724f1e9220d8")
+TEAM = os.environ.get("TAKOS_TEAM_ID", "f10187df-0a48-49ec-a7b5-27ebb9b38a47")
 DRY = os.environ.get("DRY_RUN") == "1"
 NS = uuid.UUID("6f1d3c2a-5b8e-4f7a-9c1d-2e3f4a5b6c7d")
 TAG = "[EA-FEED]"
@@ -246,6 +251,16 @@ def attach(mcp, ident, rev):
         "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": rev, "mission_id": MISSION})
 
 
+def share(mcp, ident, rev):
+    mcp.call_confirmed("share_map_object", {
+        "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": rev, "team_id": TEAM})
+
+
+def publish(mcp, ident, rev):
+    attach(mcp, ident, rev)
+    share(mcp, ident, rev)
+
+
 def upsert(mcp, item, stats):
     ident, feat = item["id"], item["feature"]
     text, cur, err = mcp.call("get_map_object", {"id": ident})
@@ -254,7 +269,7 @@ def upsert(mcp, item, stats):
         _, res, err = mcp.call("create_map_object", {"operation_id": ident, "feature": feat})
         if err or res.get("id") != ident:
             raise RuntimeError(f"create failed for {feat['name']}: {res}")
-        attach(mcp, ident, res["revision"])
+        publish(mcp, ident, res["revision"])
         stats["created"] += 1
         return
     if same(cur, feat) and fresh(cur):
@@ -264,7 +279,7 @@ def upsert(mcp, item, stats):
                                                  "expected_revision": cur["revision"], "feature": feat})
     if err or "revision" not in res:
         raise RuntimeError(f"update failed for {feat['name']}: {res}")
-    attach(mcp, ident, res["revision"])
+    publish(mcp, ident, res["revision"])
     stats["updated"] += 1
 
 
@@ -275,17 +290,24 @@ def retire_warnings(mcp, active_ids, stats):
         feat = o.get("feature", o)
         remarks = feat.get("remarks", "") or ""
         ident = o.get("id") or feat.get("id")
-        if not remarks.startswith(f"{TAG}warning") or ident in active_ids or feat.get("visible") is False:
+        if not remarks.startswith(f"{TAG}warning\n") or ident in active_ids:
             continue
         cur = mcp.call("get_map_object", {"id": ident})[1]
+        cf = cur["feature"]
+        ended = {"name": "NO LONGER IN FORCE: " + cf.get("name", "").split(": ", 1)[-1], "kind": "polygon",
+                 "geometry": cf["geometry"], "color": "#808080", "fill_color": "#808080", "fill_opacity": 0.1,
+                 "stroke_width": 2, "stroke_style": "dashed",
+                 "remarks": f"{TAG}warning-ended\nEA warning no longer in force (seen ended "
+                            f"{ea.now_utc().strftime('%d %b %H:%M UTC')}). This shape expires from devices within 24 h.\n\n"
+                            + remarks.split("\n", 1)[-1]}
+        _, res, err = mcp.call("update_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
+                                                     "expected_revision": cur["revision"], "feature": ended})
+        if err or "revision" not in res:
+            raise RuntimeError(f"retire update failed for {ident}: {res}")
+        share(mcp, ident, res["revision"])
         mcp.call_confirmed("detach_map_object_from_mission", {
-            "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": cur["revision"], "mission_id": MISSION})
-        hidden = {k: v for k, v in {
-            "name": "ENDED: " + cur["feature"].get("name", ""), "kind": "polygon",
-            "geometry": cur["feature"]["geometry"], "visible": False,
-            "remarks": f"{TAG}warning-ended\n" + remarks}.items()}
-        mcp.call("update_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
-                                       "expected_revision": cur["revision"], "feature": hidden})
+            "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": res["revision"],
+            "mission_id": MISSION})
         stats["retired"] += 1
 
 
