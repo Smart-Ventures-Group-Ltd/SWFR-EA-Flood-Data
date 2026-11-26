@@ -56,6 +56,13 @@ jobs:
         if: env.TAKOS_MCP_KEY != ''
         with:
           python-version: "3.12"
+      - name: Restore what was last sent
+        if: env.TAKOS_MCP_KEY != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: ea-state-${{ github.run_id }}
+          restore-keys: ea-state-
       - name: Sync gauges and warnings into the EA Flood Data mission
         if: env.TAKOS_MCP_KEY != ''
         env:
@@ -68,6 +75,12 @@ jobs:
         run: |
           pip install --quiet shapely
           python ea_takos_sync.py
+      - name: Save what was sent
+        if: always() && env.TAKOS_MCP_KEY != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: ea-state-${{ github.run_id }}
       - name: Skipped (no TAKOS_MCP_KEY secret yet)
         if: env.TAKOS_MCP_KEY == ''
         run: echo "Add the TAKOS_MCP_KEY repository secret to enable the GoTAK sync."
