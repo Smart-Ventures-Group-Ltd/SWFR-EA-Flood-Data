@@ -42,6 +42,10 @@ CONFIRM_GAP_S = 6.3  # GoTAK: 10 confirmed calls per minute
 MUTATE_GAP_S = 3.2   # GoTAK: 20 mutating calls per minute
 MUTATING = {"create_map_object", "update_map_object", "attach_map_object_to_mission",
             "share_map_object", "detach_map_object_from_mission", "delete_map_object"}
+ICONSET = os.environ.get("ICONSET_UID", "25fd8eb9-1e46-5b9a-a31b-e97bff448271")  # "SWFR Flood" v2
+ICON = {"high": "gauge-high.png", "normal": "gauge-normal.png", "low": "gauge-low.png",
+        "unknown": "gauge-norange.png", "none": "gauge-nodata.png", "old": "gauge-old.png"}
+LEGACY_IDS = ["5af11c7a-b9c0-45dc-9bb3-44f234c7ae38", "740f62b1-5463-4aa8-af76-a646dce71079"]  # format tests
 SIMPLIFY_DEG = 0.00015  # roughly 10-15 m; invisible at map scale
 
 COL = {"high": "#FF0000", "normal": "#2E8BFF", "low": "#FFD700", "unknown": "#FFFFFF", "none": "#808080"}
@@ -156,7 +160,14 @@ class MCP:
             m = re.search(r'confirm_token["\s:]+"?([A-Za-z0-9_\-]{8,})', text)
             token = m.group(1) if m else None
         if token and ("confirmation" in text.lower() or data.get("status") == "confirmation_required"):
-            text, data, err = self.call(tool, {**args, "confirm_token": token})
+            extra = {"confirm_token": token}
+            tm = re.search(r'confirm_target["\s:]+"([^"]+)"', text)
+            if data.get("confirm_target") or tm:
+                extra["confirm_target"] = data.get("confirm_target") or tm.group(1)
+            for k in ("target_count", "target_hash"):
+                if k in data:
+                    extra[k] = data[k]
+            text, data, err = self.call(tool, {**args, **extra})
             if err and re.search(r"token|expired|voided", text, re.I):
                 return None  # token lost to a delay; start the confirmation again
         if err:
@@ -239,7 +250,10 @@ def gauge_items():
             "name": name, "kind": "marker", "cot_type": "b-m-p-s-m", "color": COL[state],
             "geometry": {"type": "Point", "coordinates": [round(float(lon), 5), round(float(lat), 5)]},
             "remarks": remarks},
-            "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when}})
+            "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when},
+            "marker": {"name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
+                       "iconset_path": f"{ICONSET}/Gauges/{ICON['old' if age else state]}",
+                       "remarks": remarks.replace(f"{TAG}gauge\n", "", 1)}})
     return items
 
 
@@ -395,29 +409,93 @@ def retire(mcp, ident, prev):
         "operation_id": str(uuid.uuid4()), "id": ident, "expected_revision": res["revision"], "mission_id": MISSION})
 
 
+def broadcast_gauges(mcp, gauges, state, stats):
+    """Send every gauge as a live marker with its SWFR Flood icon, then clear last run's set."""
+    new_uids = []
+    for i in range(0, len(gauges), 100):
+        batch = [g["marker"] for g in gauges[i:i + 100]]
+        data = mcp.call_confirmed("broadcast_markers", {"markers": batch, "team_id": TEAM})
+        new_uids += [m["uid"] for m in data.get("markers", []) if m.get("uid")]
+    stats["gauges_sent"] = len(new_uids)
+    old = [u for u in state.get("_gauge_uids", []) if u not in set(new_uids)]
+    state["_gauge_uids"] = new_uids
+    save_state(state)
+    for i in range(0, len(old), 100):
+        try:
+            mcp.call_confirmed("clear_team_markers", {"uids": old[i:i + 100], "team_id": TEAM})
+            stats["gauges_cleared"] = stats.get("gauges_cleared", 0) + len(old[i:i + 100])
+        except Exception as exc:
+            print(f"clearing previous gauge markers failed: {exc}", file=sys.stderr)
+            state["_gauge_uids"] = new_uids + old[i:]  # retry next run
+            save_state(state)
+
+
+def cleanup_legacy(mcp, gauges, state, stats, t0):
+    """Remove the earlier native gauge objects (yellow markers) from devices and the mission."""
+    done = set(state.get("_legacy_done", []))
+    ids = [i for i in [g["id"] for g in gauges] + LEGACY_IDS if i not in done]
+    if not ids:
+        return
+    if not state.get("_legacy_cleared"):
+        for i in range(0, len(ids), 100):
+            mcp.call_confirmed("clear_team_markers", {"uids": ids[i:i + 100], "team_id": TEAM})
+        state["_legacy_cleared"] = True
+        save_state(state)
+    for ident in ids:
+        if time.monotonic() - t0 > TIME_BUDGET_S:
+            stats["legacy_left"] = stats.get("legacy_left", 0) + 1
+            continue
+        try:
+            text, cur, err = mcp.call("get_map_object", {"id": ident})
+            if not err and cur.get("id") == ident and not cur.get("deleted"):
+                try:
+                    mcp.call_confirmed("detach_map_object_from_mission", {
+                        "operation_id": str(uuid.uuid4()), "id": ident,
+                        "expected_revision": cur["revision"], "mission_id": MISSION})
+                except RuntimeError as exc:
+                    if "not attached" not in str(exc).lower() and "membership" not in str(exc).lower():
+                        raise
+                mcp.call("delete_map_object", {"operation_id": str(uuid.uuid4()), "id": ident,
+                                               "expected_revision": cur["revision"]})
+                stats["legacy_removed"] = stats.get("legacy_removed", 0) + 1
+            done.add(ident)
+            state.pop(ident, None)
+            state["_legacy_done"] = sorted(done)
+            save_state(state)
+        except Exception as exc:
+            stats["failed"] += 1
+            print(f"FAILED removing old gauge object {ident}: {exc}", file=sys.stderr)
+
+
 def main():
     t0 = time.monotonic()
     gauges, warnings = gauge_items(), warning_items()
-    items = warnings + gauges
     state = load_state()
     queue = []
-    for it in items:
+    for it in warnings:
         p = priority(it, state.get(it["id"]))
         if p is not None:
             queue.append((p, it))
     queue.sort(key=lambda x: x[0])
     active = {w["id"] for w in warnings}
-    ended = [i for i, v in state.items() if v.get("kind") == "warning" and v.get("active") and i not in active]
-    print(f"EA: {len(gauges)} gauges, {len(warnings)} warning shapes; {len(queue)} to send, {len(ended)} to retire")
+    ended = [i for i, v in state.items()
+             if isinstance(v, dict) and v.get("kind") == "warning" and v.get("active") and i not in active]
+    print(f"EA: {len(gauges)} gauges (live markers), {len(warnings)} warning shapes; "
+          f"{len(queue)} warnings to send, {len(ended)} to retire")
     if DRY:
-        for p, it in queue[:8]:
-            print(" ", p, it["feature"]["kind"], "|", it["feature"]["name"])
+        for g in gauges[:6]:
+            print("  gauge |", g["marker"]["name"], "|", g["marker"]["iconset_path"].split("/")[-1])
         return
     if not KEY:
         raise SystemExit("TAKOS_MCP_KEY is not set")
     mcp = MCP(URL, KEY)
     mcp.start()
     stats = {"created": 0, "updated": 0, "resent": 0, "retired": 0, "failed": 0, "deferred": 0}
+    try:
+        broadcast_gauges(mcp, gauges, state, stats)
+    except Exception as exc:
+        stats["failed"] += 1
+        print(f"FAILED gauge broadcast: {exc}", file=sys.stderr)
     for ident in ended:
         if time.monotonic() - t0 > TIME_BUDGET_S:
             stats["deferred"] += 1
@@ -444,10 +522,14 @@ def main():
         except Exception as exc:
             stats["failed"] += 1
             print(f"FAILED {it['feature']['name']}: {exc}", file=sys.stderr)
+    try:
+        cleanup_legacy(mcp, gauges, state, stats, t0)
+    except Exception as exc:
+        stats["failed"] += 1
+        print(f"legacy cleanup failed: {exc}", file=sys.stderr)
     save_state(state)
     print(json.dumps(stats))
-    attempted = len(queue) + len(ended) - stats["deferred"]
-    if attempted and stats["failed"] > attempted // 2:
+    if stats.get("gauges_sent", 0) == 0 and gauges:
         sys.exit(1)
 
 
