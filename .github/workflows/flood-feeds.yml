@@ -10,10 +10,6 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: pages
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,9 +32,41 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: true
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+  sync-gotak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    concurrency:
+      group: takos-sync
+      cancel-in-progress: false
+    env:
+      TAKOS_MCP_KEY: ${{ secrets.TAKOS_MCP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.TAKOS_MCP_KEY != ''
+      - uses: actions/setup-python@v5
+        if: env.TAKOS_MCP_KEY != ''
+        with:
+          python-version: "3.12"
+      - name: Sync gauges and warnings into the EA Flood Data mission
+        if: env.TAKOS_MCP_KEY != ''
+        env:
+          TAKOS_MCP_URL: https://live.gotak.dev/api/mcp
+          TAKOS_MISSION_ID: b8a434af-ad21-4e7e-bd32-724f1e9220d8
+          CENTRE_LAT: "52.192"
+          CENTRE_LON: "-2.22"
+          RADIUS_KM: "35"
+        run: |
+          pip install --quiet shapely
+          python ea_takos_sync.py
+      - name: Skipped (no TAKOS_MCP_KEY secret yet)
+        if: env.TAKOS_MCP_KEY == ''
+        run: echo "Add the TAKOS_MCP_KEY repository secret to enable the GoTAK sync."
