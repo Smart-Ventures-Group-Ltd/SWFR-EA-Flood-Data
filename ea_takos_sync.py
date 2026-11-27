@@ -26,6 +26,7 @@ import urllib.request
 import uuid
 
 import ea_flood_kml as ea
+import tak_direct
 
 URL = os.environ.get("TAKOS_MCP_URL", "https://live.gotak.dev/api/mcp")
 KEY = os.environ.get("TAKOS_MCP_KEY", "")
@@ -45,6 +46,9 @@ MUTATING = {"create_map_object", "update_map_object", "attach_map_object_to_miss
 ICONSET = os.environ.get("ICONSET_UID", "25fd8eb9-1e46-5b9a-a31b-e97bff448271")  # "SWFR Flood" v2
 ICON = {"high": "gauge-high.png", "normal": "gauge-normal.png", "low": "gauge-low.png",
         "unknown": "gauge-norange.png", "none": "gauge-nodata.png", "old": "gauge-old.png"}
+# test items from 26 Nov 2026 to remove from every device once the direct feed is live
+ONE_OFF_DELETES = ["a7b66b8f-72fe-44d7-8fb9-037e3a980242", "554251a9-88b4-4383-b059-99b8a09d0f4f",
+                   "mcp-98afc374-3757-4b7b-a12f-447de9b6eba5", "swfr-fmttest-high", "swfr-fmttest-low"]
 LEGACY_IDS = ["5af11c7a-b9c0-45dc-9bb3-44f234c7ae38", "740f62b1-5463-4aa8-af76-a646dce71079"]  # format tests
 SIMPLIFY_DEG = 0.00015  # roughly 10-15 m; invisible at map scale
 
@@ -251,7 +255,7 @@ def gauge_items():
             "geometry": {"type": "Point", "coordinates": [round(float(lon), 5), round(float(lat), 5)]},
             "remarks": remarks},
             "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when},
-            "marker": {"name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
+            "marker": {"uid": f"SWFR-EA-GAUGE-{ref}", "name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
                        "iconset_path": f"{ICONSET}/Gauges/{ICON['old' if age else state]}",
                        "remarks": remarks.replace(f"{TAG}gauge\n", "", 1)}})
     return items
@@ -430,6 +434,36 @@ def broadcast_gauges(mcp, gauges, state, stats):
             save_state(state)
 
 
+def direct_gauges(mcp, gauges, state, stats):
+    """Send every gauge as an ATAK-format icon marker with a fixed uid, straight to the TAK server."""
+    td = tak_direct
+    current = {g["marker"]["uid"] for g in gauges}
+    gone = [u for u in state.get("_direct_uids", []) if u not in current]
+    old_bcast = list(state.get("_gauge_uids", []))
+    pending = [u for u in ONE_OFF_DELETES if u not in set(state.get("_one_off_done", []))]
+    events = [td.marker(m["uid"], m["name"], m["lat"], m["lon"], m["iconset_path"], m["remarks"])
+              for m in (g["marker"] for g in gauges)]
+    events += [td.delete(u) for u in gone + old_bcast + pending]
+    client = td.make_client()
+    try:
+        client.send(events)
+    finally:
+        client.close()
+    stats["gauges_sent"] = len(gauges)
+    stats["deleted"] = len(gone) + len(old_bcast) + len(pending)
+    state["_direct_uids"] = sorted(current)
+    state["_one_off_done"] = sorted(set(state.get("_one_off_done", [])) | set(pending))
+    save_state(state)
+    if old_bcast:  # belt and braces: also clear GoTAK's own record of the old broadcast markers
+        try:
+            for i in range(0, len(old_bcast), 100):
+                mcp.call_confirmed("clear_team_markers", {"uids": old_bcast[i:i + 100], "team_id": TEAM})
+        except Exception as exc:
+            print(f"clearing old broadcast markers in GoTAK failed (devices already told): {exc}", file=sys.stderr)
+    state["_gauge_uids"] = []
+    save_state(state)
+
+
 def cleanup_legacy(mcp, gauges, state, stats, t0):
     """Remove the earlier native gauge objects (yellow markers) from devices and the mission."""
     done = set(state.get("_legacy_done", []))
@@ -492,10 +526,14 @@ def main():
     mcp.start()
     stats = {"created": 0, "updated": 0, "resent": 0, "retired": 0, "failed": 0, "deferred": 0}
     try:
-        broadcast_gauges(mcp, gauges, state, stats)
+        if tak_direct.configured():
+            direct_gauges(mcp, gauges, state, stats)
+        else:
+            broadcast_gauges(mcp, gauges, state, stats)
     except Exception as exc:
         stats["failed"] += 1
-        print(f"FAILED gauge broadcast: {exc}", file=sys.stderr)
+        print(f"FAILED gauge send ({'direct' if tak_direct.configured() else 'broadcast'}): {type(exc).__name__}: {exc}",
+              file=sys.stderr)
     for ident in ended:
         if time.monotonic() - t0 > TIME_BUDGET_S:
             stats["deferred"] += 1
