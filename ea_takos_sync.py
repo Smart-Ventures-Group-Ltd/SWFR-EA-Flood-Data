@@ -56,6 +56,12 @@ SIMPLIFY_DEG = 0.00015  # roughly 10-15 m; invisible at map scale
 COL = {"high": "#FF0000", "normal": "#2E8BFF", "low": "#FFD700", "unknown": "#FFFFFF", "none": "#808080"}
 WARN = {1: ("SEVERE FLOOD WARNING", "#8B0000", 0.5), 2: ("FLOOD WARNING", "#FF0000", 0.35),
         3: ("FLOOD ALERT", "#FF8C00", 0.25)}
+ENDED = ("NO LONGER IN FORCE", "#808080", 0.1)  # EA severity 4: shown grey until the EA drops it
+POLY_DIR = os.environ.get("POLY_DIR", "state/polys")
+AREA_POINTS = int(os.environ.get("AREA_POINTS", "600"))  # per warning area (all parts), so phones aren't sent huge outlines
+MIN_PART = float(os.environ.get("MIN_PART", "0.02"))      # drop parts smaller than this share of the largest
+MAX_PARTS = int(os.environ.get("MAX_PARTS", "20"))      # largest parts of a multi-part flood area
+WARN_REFRESH_H = float(os.environ.get("WARN_REFRESH_H", "12"))
 
 
 # ---------------------------------------------------------------- MCP client
@@ -185,13 +191,13 @@ def oid(kind, ref):
     return str(uuid.uuid5(NS, f"{kind}:{ref}"))
 
 
-def simplify(ring):
+def simplify(ring, tol=None):
     try:
         from shapely.geometry import Polygon
         p = Polygon(ring)
         if not p.is_valid:
             p = p.buffer(0)
-        s = p.simplify(SIMPLIFY_DEG, preserve_topology=True)
+        s = p.simplify(tol or SIMPLIFY_DEG, preserve_topology=True)
         if s.geom_type == "Polygon" and len(s.exterior.coords) >= 4:
             ring = list(s.exterior.coords)
     except Exception:
@@ -548,6 +554,115 @@ def direct_gauges(mcp, gauges, state, stats):
     save_state(state)
 
 
+def area_rings(code, polygon_url):
+    """Simplified outer rings for a flood area, cached on disk (flood area outlines don't change)."""
+    path = os.path.join(POLY_DIR, re.sub(r"[^A-Za-z0-9_-]", "_", code) + ".json")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        pass
+    gj = ea.get(polygon_url)
+    geoms = [x.get("geometry", x) for x in gj.get("features", [gj])]
+    rings = []
+    for g in geoms:
+        if g.get("type") == "Polygon":
+            rings.append(g["coordinates"][0])
+        elif g.get("type") == "MultiPolygon":
+            rings += [p[0] for p in g["coordinates"]]
+    def area(r):
+        return abs(sum(x1 * y2 - x2 * y1 for (x1, y1, *_), (x2, y2, *_) in zip(r, r[1:] + r[:1]))) / 2
+    rings = sorted(rings, key=area, reverse=True)[:MAX_PARTS]
+    if not rings:
+        return []
+    big = area(rings[0]) or 1
+    rings = [r for r in rings if area(r) >= MIN_PART * big]
+    tol = SIMPLIFY_DEG
+    while True:
+        out = [r for r in (simplify(r, tol) for r in rings) if len(r) >= 4]
+        if sum(len(r) for r in out) <= AREA_POINTS or tol >= 0.02:
+            break
+        tol *= 1.6
+    while sum(len(r) for r in out) > AREA_POINTS and len(out) > 1:
+        out.pop()
+    if out and len(out[0]) > AREA_POINTS:
+        step = len(out[0]) // AREA_POINTS + 1
+        out[0] = out[0][:-1:step] + [out[0][0]]
+    os.makedirs(POLY_DIR, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(out, fh)
+    return out
+
+
+def direct_warnings(mcp, state, stats):
+    """Every EA flood warning, alert and severe warning in England as a filled shape, sent straight to the
+    TAK server. Re-sent only when severity or message changes, or every WARN_REFRESH_H hours; removed when
+    the EA drops it."""
+    td = tak_direct
+    floods = ea.get("/id/floods")["items"]
+    sent = state.get("_wsent", {})
+    now = ea.now_utc().timestamp()
+    events, current, new_sent, counts = [], set(), {}, {}
+    for f in floods:
+        lvl = f.get("severityLevel", 4)
+        label, colour, opacity = WARN.get(lvl, ENDED)
+        area = f.get("floodArea") or {}
+        code = f.get("floodAreaID", "")
+        if not code or not area.get("polygon"):
+            continue
+        try:
+            rings = area_rings(code, area["polygon"])
+        except Exception as exc:
+            print(f"outline for {code} failed: {exc}", file=sys.stderr)
+            continue
+        msg = (f.get("message") or "").strip()
+        remarks = (f"{label}: {f.get('description', '')}\nArea code: {code}\n"
+                   f"River/sea: {area.get('riverOrSea', '')}\nCounty: {area.get('county', '')}\n"
+                   f"Severity changed: {f.get('timeSeverityChanged', '')}\n"
+                   f"Message changed: {f.get('timeMessageChanged', '')}\n\n{msg[:1500]}\n\n"
+                   f"https://check-for-flooding.service.gov.uk/target-area/{code}\n"
+                   "Source: Environment Agency real-time API (beta), OGL v3. Official EA warnings are authoritative.")
+        sig = f"{lvl}|{f.get('timeMessageChanged', '')}|{f.get('timeSeverityChanged', '')}"
+        counts[label] = counts.get(label, 0) + 1
+        for i, ring in enumerate(rings):
+            uid = f"SWFR-EA-WARN-{code}-{i}"
+            current.add(uid)
+            prev = sent.get(uid)
+            if prev and prev[0] == sig and now - prev[1] < WARN_REFRESH_H * 3600:
+                new_sent[uid] = prev
+                continue
+            name = f"{label}: {f.get('description', '')}" + (f" ({i + 1})" if i else "")
+            events.append(td.polygon(uid, name, ring, colour, colour, opacity, remarks,
+                                     weight=2 if lvl == 4 else 3))
+            new_sent[uid] = [sig, now]
+    ended = [u for u in sent if u not in current]
+    events += [td.delete(u) for u in ended]
+    # warnings published earlier through the GoTAK tool: remove from devices and from the Data Sync mission
+    legacy = [i for i, v in state.items() if isinstance(v, dict) and v.get("kind") == "warning" and v.get("active")]
+    events += [td.delete(i) for i in legacy]
+    if events:
+        client = td.make_client()
+        try:
+            client.send(events, pause=0.01)
+        finally:
+            client.close()
+    for i in legacy:
+        state[i]["active"] = False
+        try:
+            cur = mcp.call("get_map_object", {"id": i})[1]
+            if cur.get("revision"):
+                mcp.call_confirmed("detach_map_object_from_mission", {
+                    "operation_id": str(uuid.uuid4()), "id": i, "expected_revision": cur["revision"],
+                    "mission_id": MISSION})
+        except Exception as exc:
+            print(f"could not detach old warning {i} from the mission: {exc}", file=sys.stderr)
+    state["_wsent"] = new_sent
+    save_state(state)
+    stats["warning_areas"] = counts
+    stats["warning_shapes_sent"] = len(events) - len(ended) - len(legacy)
+    stats["warning_shapes_removed"] = len(ended) + len(legacy)
+
+
 def cleanup_legacy(mcp, gauges, state, stats, t0):
     """Remove the earlier native gauge objects (yellow markers) from devices and the mission."""
     done = set(state.get("_legacy_done", []))
@@ -588,7 +703,9 @@ def cleanup_legacy(mcp, gauges, state, stats, t0):
 def main():
     t0 = time.monotonic()
     state = load_state()
-    gauges, warnings = gauge_items(state), warning_items()
+    direct = tak_direct.configured()
+    gauges = gauge_items(state)
+    warnings = [] if direct else warning_items()
     queue = []
     for it in warnings:
         p = priority(it, state.get(it["id"]))
@@ -598,8 +715,9 @@ def main():
     active = {w["id"] for w in warnings}
     ended = [i for i, v in state.items()
              if isinstance(v, dict) and v.get("kind") == "warning" and v.get("active") and i not in active]
-    print(f"EA: {len(gauges)} gauges (live markers), {len(warnings)} warning shapes; "
-          f"{len(queue)} warnings to send, {len(ended)} to retire")
+    print(f"EA: {len(gauges)} gauges; warnings via "
+          + ("direct connection, all of England" if direct else
+             f"GoTAK tool: {len(warnings)} shapes, {len(queue)} to send, {len(ended)} to retire"))
     if DRY:
         for g in gauges[:6]:
             print("  gauge |", g["marker"]["name"], "|", g["marker"]["iconset_path"].split("/")[-1])
@@ -618,6 +736,13 @@ def main():
         stats["failed"] += 1
         print(f"FAILED gauge send ({'direct' if tak_direct.configured() else 'broadcast'}): {type(exc).__name__}: {exc}",
               file=sys.stderr)
+    if direct:
+        try:
+            direct_warnings(mcp, state, stats)
+        except Exception as exc:
+            stats["failed"] += 1
+            print(f"FAILED warnings (direct): {type(exc).__name__}: {exc}", file=sys.stderr)
+        ended, queue = [], []
     for ident in ended:
         if time.monotonic() - t0 > TIME_BUDGET_S:
             stats["deferred"] += 1

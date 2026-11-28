@@ -217,3 +217,27 @@ def delete(uid):
             f'how="h-g-i-g-o" time="{_iso(t)}" start="{_iso(t)}" stale="{_iso(t + dt.timedelta(minutes=5))}">'
             f'<point lat="0" lon="0" hae="9999999.0" ce="9999999.0" le="9999999.0"/>'
             f'<detail><link uid={quoteattr(uid)} relation="none" type="none"/><__forcedelete/></detail></event>')
+
+
+def argb(hex_colour, opacity=1.0):
+    """'#RRGGBB' + opacity -> the signed 32-bit ARGB integer TAK uses for colours."""
+    h = hex_colour.lstrip("#")
+    v = (int(round(max(0.0, min(1.0, opacity)) * 255)) << 24) | int(h, 16)
+    return v - (1 << 32) if v >= 1 << 31 else v
+
+
+def polygon(uid, name, ring, stroke_hex, fill_hex, fill_opacity, remarks, stale_hours=24, weight=3):
+    """Filled shape in the exact layout of the GoTAK polygon that iTAK drew and kept through a restart.
+    ring: [[lon, lat], ...], closed (first point repeated at the end)."""
+    t = _now()
+    lat0 = sum(p[1] for p in ring[:-1]) / max(len(ring) - 1, 1)
+    lon0 = sum(p[0] for p in ring[:-1]) / max(len(ring) - 1, 1)
+    pts = "".join(f'<link point="{p[1]},{p[0]},9999999" type="b-m-p-c" relation="c"/>' for p in ring)
+    return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<event version="2.0" type="u-d-f" uid={quoteattr(uid)} time="{_iso(t)}" start="{_iso(t)}" '
+            f'stale="{_iso(t + dt.timedelta(hours=stale_hours))}" how="h-g-i-g-o">'
+            f'<point lat="{lat0:.6f}" lon="{lon0:.6f}" hae="9999999" ce="9999999" le="9999999"/>'
+            f'<detail><contact callsign={quoteattr(name)}/><color argb="{argb(stroke_hex)}"/>'
+            f'<strokeColor value="{argb(stroke_hex)}"/><strokeWeight value="{weight}"/>'
+            f'<fillColor value="{argb(fill_hex, fill_opacity)}"/>{pts}'
+            f'<remarks>{escape(remarks)}</remarks></detail></event>')
