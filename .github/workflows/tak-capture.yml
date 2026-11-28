@@ -1,0 +1,31 @@
+name: TAK marker capture (diagnostic)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Listen for custom-icon markers
+        env:
+          TAK_HOST: eud.gotak.dev
+          TAK_COT_PORT: "8089"
+          TAK_CLIENT_UID: SWFR-EA-CAPTURE
+          TAK_CALLSIGN: EA Feed Capture
+          LISTEN_S: "360"
+          TAK_CLIENT_P12_B64: ${{ secrets.TAK_CLIENT_P12_B64 }}
+          TAK_CLIENT_P12_PASSWORD: ${{ secrets.TAK_CLIENT_P12_PASSWORD }}
+          TAK_TRUST_P12_B64: ${{ secrets.TAK_TRUST_P12_B64 }}
+          TAK_TRUST_P12_PASSWORD: ${{ secrets.TAK_TRUST_P12_PASSWORD }}
+        run: |
+          pip install --quiet cryptography
+          python tak_capture.py
