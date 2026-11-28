@@ -17,6 +17,7 @@ mission and left to expire on devices after 24 h. Objects are never deleted, so
 ids are never reused.
 """
 import json
+import math
 import os
 import re
 import sys
@@ -202,62 +203,119 @@ def simplify(ring):
     return out
 
 
-def gauge_items():
-    stations = ea.get(f"/id/stations?parameter=level&lat={ea.LAT}&long={ea.LON}&dist={ea.DIST_KM:g}&_view=full")["items"]
-    latest = ea.latest_by_measure("level")
-    items = []
-    for s in stations:
-        lat, lon, ref = s.get("lat"), s.get("long"), s.get("stationReference")
-        if isinstance(lat, list) or lat is None or lon is None or not ref:
+NEIGHBOUR_KM = float(os.environ.get("NEIGHBOUR_KM", "30"))   # same-river gauges shown either side of a HIGH one
+HIGH_HOLD_H = float(os.environ.get("HIGH_HOLD_H", "3"))      # keep showing a gauge this long after it was last HIGH
+NATIONAL_MAX = int(os.environ.get("NATIONAL_MAX", "1500"))   # cap on gauges sent, HIGH ones first
+
+
+def km(lat1, lon1, lat2, lon2):
+    x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
+    return 6371 * math.hypot(x, math.radians(lat2 - lat1))
+
+
+def make_gauge(s, latest, fallback=True, why=""):
+    lat, lon, ref = s.get("lat"), s.get("long"), s.get("stationReference")
+    if isinstance(lat, list) or lat is None or lon is None or not ref:
+        return None
+    reading, unit = None, ""
+    for m in ea.as_list(s.get("measures")):
+        if m.get("parameter") != "level":
             continue
-        reading, unit = None, ""
-        for m in ea.as_list(s.get("measures")):
-            if m.get("parameter") != "level":
+        r = latest.get(str(m.get("@id", "")).replace("http://", "https://", 1))
+        if r and (reading is None or m.get("qualifier") == "Stage"):
+            reading = r
+        unit = unit or m.get("unitName", "")
+    if not reading and fallback:
+        reading = ea.last_reading_fallback(ref)
+    sc = s.get("stageScale") if isinstance(s.get("stageScale"), dict) else {}
+    lo, hi = sc.get("typicalRangeLow"), sc.get("typicalRangeHigh")
+    rec = (sc.get("highestRecent") or {}).get("value")
+    label = str(s.get("label", ref))
+    state, tag, v, age, when = "none", "", None, "", ""
+    if reading and isinstance(reading.get("value"), (int, float)):
+        v = reading["value"]
+        t = ea.parse_time(reading.get("dateTime", ""))
+        when = reading.get("dateTime", "")
+        if hi is not None and v > hi:
+            state, tag = "high", " HIGH"
+        elif lo is not None and v < lo:
+            state, tag = "low", " LOW"
+        elif hi is not None or lo is not None:
+            state = "normal"
+        else:
+            state = "unknown"
+        if t and (ea.now_utc() - t).total_seconds() > ea.STALE_MINUTES * 60:
+            age = uk_time(t)
+    name = label if v is None else f"{label} {v:.2f}m{tag}"
+    if age:
+        name += f" @{age}"
+    status = {"high": "ABOVE typical range", "low": "Below typical range", "normal": "Within typical range",
+              "unknown": "No typical range published", "none": "No reading in the last ~4 weeks"}[state]
+    remarks = (f"{TAG}gauge\nEA river gauge: {label}\nRiver: {s.get('riverName', '')}\n"
+               f"Level: {'n/a' if v is None else f'{v:.2f} {unit}'}\nStatus: {status}\n"
+               f"Typical range: {lo} to {hi}\nHighest recent: {rec}\n"
+               f"Reading: {when or 'n/a'}{' (no newer reading available)' if age else ''}\n"
+               f"https://check-for-flooding.service.gov.uk/station/{s.get('RLOIid', '')}\n"
+               "Source: Environment Agency real-time API (beta), OGL v3. Not for safety-critical use.")
+    return {"id": oid("gauge", ref), "feature": {
+        "name": name, "kind": "marker", "cot_type": "b-m-p-s-m", "color": COL[state],
+        "geometry": {"type": "Point", "coordinates": [round(float(lon), 5), round(float(lat), 5)]},
+        "remarks": remarks},
+        "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when},
+        "marker": {"uid": f"SWFR-EA-GAUGE-{ref}", "label": label, "name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
+                   "iconset_path": f"{ICONSET}/Gauges/{ICON['old' if age else state]}",
+                   "remarks": (why + "\n" if why else "") + remarks.replace(f"{TAG}gauge\n", "", 1)},
+        "ref": ref, "river": str(s.get("riverName") or "").strip().lower(), "lat": float(lat), "lon": float(lon),
+        "high_now": state == "high" and not age}
+
+
+def gauge_items(state=None):
+    """Every gauge in the local area, plus, anywhere in England, gauges that are HIGH (or were within
+    HIGH_HOLD_H hours) and every gauge on the same river within NEIGHBOUR_KM of them."""
+    state = state if state is not None else {}
+    latest = ea.latest_by_measure("level")
+    local_st = ea.get(f"/id/stations?parameter=level&lat={ea.LAT}&long={ea.LON}&dist={ea.DIST_KM:g}&_view=full")["items"]
+    items, seen = [], set()
+    for st in local_st:
+        g = make_gauge(st, latest)
+        if g and g["ref"] not in seen:
+            items.append(g)
+            seen.add(g["ref"])
+    try:
+        all_st = ea.get("/id/stations?parameter=level&_view=full&_limit=10000")["items"]
+    except Exception as exc:
+        print(f"England-wide station list failed, local gauges only: {exc}", file=sys.stderr)
+        return items
+    nat = [g for g in (make_gauge(st, latest, fallback=False) for st in all_st) if g and g["ref"] not in seen]
+    now = ea.now_utc().timestamp()
+    held = {k: v for k, v in state.get("_high_seen", {}).items() if now - v < HIGH_HOLD_H * 3600}
+    for g in nat + items:
+        if g["high_now"]:
+            held[g["ref"]] = now
+    state["_high_seen"] = held
+    trig = [g for g in nat + items if g["ref"] in held]
+    chosen = {}
+    for t in trig:
+        if t["ref"] not in seen:
+            chosen[t["ref"]] = (0, t, "Shown England-wide: above typical range" if t["high_now"]
+                                else f"Shown England-wide: above typical range within the last {HIGH_HOLD_H:g} h")
+    for t in trig:
+        if not t["river"]:
+            continue
+        for g in nat:
+            if g["ref"] in chosen or g["river"] != t["river"]:
                 continue
-            r = latest.get(str(m.get("@id", "")).replace("http://", "https://", 1))
-            if r and (reading is None or m.get("qualifier") == "Stage"):
-                reading = r
-            unit = unit or m.get("unitName", "")
-        if not reading:
-            reading = ea.last_reading_fallback(ref)
-        sc = s.get("stageScale") if isinstance(s.get("stageScale"), dict) else {}
-        lo, hi = sc.get("typicalRangeLow"), sc.get("typicalRangeHigh")
-        rec = (sc.get("highestRecent") or {}).get("value")
-        label = str(s.get("label", ref))
-        state, tag, v, age, when = "none", "", None, "", ""
-        if reading and isinstance(reading.get("value"), (int, float)):
-            v = reading["value"]
-            t = ea.parse_time(reading.get("dateTime", ""))
-            when = reading.get("dateTime", "")
-            if hi is not None and v > hi:
-                state, tag = "high", " HIGH"
-            elif lo is not None and v < lo:
-                state, tag = "low", " LOW"
-            elif hi is not None or lo is not None:
-                state = "normal"
-            else:
-                state = "unknown"
-            if t and (ea.now_utc() - t).total_seconds() > ea.STALE_MINUTES * 60:
-                age = uk_time(t)
-        name = label if v is None else f"{label} {v:.2f}m{tag}"
-        if age:
-            name += f" @{age}"
-        status = {"high": "ABOVE typical range", "low": "Below typical range", "normal": "Within typical range",
-                  "unknown": "No typical range published", "none": "No reading in the last ~4 weeks"}[state]
-        remarks = (f"{TAG}gauge\nEA river gauge: {label}\nRiver: {s.get('riverName', '')}\n"
-                   f"Level: {'n/a' if v is None else f'{v:.2f} {unit}'}\nStatus: {status}\n"
-                   f"Typical range: {lo} to {hi}\nHighest recent: {rec}\n"
-                   f"Reading: {when or 'n/a'}{' (no newer reading available)' if age else ''}\n"
-                   f"https://check-for-flooding.service.gov.uk/station/{s.get('RLOIid', '')}\n"
-                   "Source: Environment Agency real-time API (beta), OGL v3. Not for safety-critical use.")
-        items.append({"id": oid("gauge", ref), "feature": {
-            "name": name, "kind": "marker", "cot_type": "b-m-p-s-m", "color": COL[state],
-            "geometry": {"type": "Point", "coordinates": [round(float(lon), 5), round(float(lat), 5)]},
-            "remarks": remarks},
-            "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when},
-            "marker": {"uid": f"SWFR-EA-GAUGE-{ref}", "label": label, "name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
-                       "iconset_path": f"{ICONSET}/Gauges/{ICON['old' if age else state]}",
-                       "remarks": remarks.replace(f"{TAG}gauge\n", "", 1)}})
+            d = km(t["lat"], t["lon"], g["lat"], g["lon"])
+            if d <= NEIGHBOUR_KM:
+                label = t["marker"]["label"]
+                chosen[g["ref"]] = (1, g, f"Shown because it is on the same river as {label} ({d:.0f} km away), "
+                                          "which is above typical range")
+    room = max(NATIONAL_MAX - len(items), 0)
+    picked = sorted(chosen.values(), key=lambda x: x[0])[:room]
+    byref = {st.get("stationReference"): st for st in all_st}
+    for _, g, why in picked:
+        g2 = make_gauge(byref[g["ref"]], latest, fallback="Level: n/a" in g["marker"]["remarks"], why=why)
+        items.append(g2 or g)
     return items
 
 
@@ -529,8 +587,8 @@ def cleanup_legacy(mcp, gauges, state, stats, t0):
 
 def main():
     t0 = time.monotonic()
-    gauges, warnings = gauge_items(), warning_items()
     state = load_state()
+    gauges, warnings = gauge_items(state), warning_items()
     queue = []
     for it in warnings:
         p = priority(it, state.get(it["id"]))
