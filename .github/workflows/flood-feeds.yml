@@ -92,3 +92,31 @@ jobs:
       - name: Skipped (no TAKOS_MCP_KEY secret yet)
         if: env.TAKOS_MCP_KEY == ''
         run: echo "Add the TAKOS_MCP_KEY repository secret to enable the GoTAK sync."
+  next:
+    # Keeps the 15-minute cycle going: GitHub's own schedule only fires every few hours. Each run starts
+    # the next one at the following quarter-hour slot. The schedule above stays as a safety net that
+    # restarts the chain if it ever breaks. Cancelling a run in the Actions tab stops the chain.
+    needs: [deploy, sync-gotak]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Wait for the next 15-minute slot, then start the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ME: ${{ github.run_id }}
+        run: |
+          busy() {
+            gh run list -R "$REPO" -w flood-feeds.yml -L 20 --json databaseId,status \
+              -q "[.[] | select(.status != \"completed\" and .databaseId != $ME)] | length"
+          }
+          if [ "$(busy)" != "0" ]; then echo "Another run is already queued or running, so this chain stops here."; exit 0; fi
+          now=$(date +%s); next=$(( (now / 900 + 1) * 900 + 120 ))
+          if [ $(( next - now )) -lt 120 ]; then next=$(( next + 900 )); fi
+          echo "Next run at $(date -u -d @$next +%H:%M) UTC"; sleep $(( next - now ))
+          if [ "$(busy)" != "0" ]; then echo "Another run started meanwhile, so this chain stops here."; exit 0; fi
+          gh workflow run flood-feeds.yml -R "$REPO" --ref main
