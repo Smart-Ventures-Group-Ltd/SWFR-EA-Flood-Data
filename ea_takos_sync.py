@@ -255,7 +255,7 @@ def gauge_items():
             "geometry": {"type": "Point", "coordinates": [round(float(lon), 5), round(float(lat), 5)]},
             "remarks": remarks},
             "meta": {"kind": "gauge", "level": v, "state": state, "stale": bool(age), "reading": when},
-            "marker": {"uid": f"SWFR-EA-GAUGE-{ref}", "name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
+            "marker": {"uid": f"SWFR-EA-GAUGE-{ref}", "label": label, "name": name, "lat": round(float(lat), 5), "lon": round(float(lon), 5), "cot_type": "a-u-G",
                        "iconset_path": f"{ICONSET}/Gauges/{ICON['old' if age else state]}",
                        "remarks": remarks.replace(f"{TAG}gauge\n", "", 1)}})
     return items
@@ -434,6 +434,25 @@ def broadcast_gauges(mcp, gauges, state, stats):
             save_state(state)
 
 
+def old_broadcast_uids(mcp, gauges, state):
+    """GoTAK broadcast copies of our gauges still on devices: mcp-* uids in the last 24 h of CoT history whose
+    name starts with one of our gauge labels. Anything else (e.g. markers placed by team members) is left alone."""
+    labels = sorted({g["marker"]["label"] for g in gauges}, key=len, reverse=True)
+    done = set(state.get("_purged", []))
+    _, data, err = mcp.call("query_cot_history", {"type_prefix": "a-u-G", "since_minutes": 1440, "limit": 500})
+    if err:
+        print("could not read CoT history for old broadcast markers", file=sys.stderr)
+        return []
+    found = []
+    for ev in data.get("events", []):
+        uid, name = str(ev.get("uid", "")), str(ev.get("callsign", ""))
+        if not uid.startswith("mcp-") or uid in done or uid in found:
+            continue
+        if any(name == lb or name.startswith(lb + " ") for lb in labels):
+            found.append(uid)
+    return found
+
+
 def direct_gauges(mcp, gauges, state, stats):
     """Send every gauge as an ATAK-format icon marker with a fixed uid, straight to the TAK server."""
     td = tak_direct
@@ -441,18 +460,25 @@ def direct_gauges(mcp, gauges, state, stats):
     gone = [u for u in state.get("_direct_uids", []) if u not in current]
     old_bcast = list(state.get("_gauge_uids", []))
     pending = [u for u in ONE_OFF_DELETES if u not in set(state.get("_one_off_done", []))]
+    try:
+        purge = old_broadcast_uids(mcp, gauges, state)
+    except Exception as exc:
+        print(f"old broadcast lookup failed: {exc}", file=sys.stderr)
+        purge = []
     events = [td.marker(m["uid"], m["name"], m["lat"], m["lon"], m["iconset_path"], m["remarks"])
               for m in (g["marker"] for g in gauges)]
-    events += [td.delete(u) for u in gone + old_bcast + pending]
+    events += [td.delete(u) for u in gone + old_bcast + pending + purge]
     client = td.make_client()
     try:
         client.send(events)
     finally:
         client.close()
     stats["gauges_sent"] = len(gauges)
-    stats["deleted"] = len(gone) + len(old_bcast) + len(pending)
+    stats["deleted"] = len(gone) + len(old_bcast) + len(pending) + len(purge)
+    stats["old_copies_deleted"] = len(purge)
     state["_direct_uids"] = sorted(current)
     state["_one_off_done"] = sorted(set(state.get("_one_off_done", [])) | set(pending))
+    state["_purged"] = sorted(set(state.get("_purged", [])) | set(purge))[-3000:]
     save_state(state)
     if old_bcast:  # belt and braces: also clear GoTAK's own record of the old broadcast markers
         try:

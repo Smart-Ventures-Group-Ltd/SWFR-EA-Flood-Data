@@ -198,15 +198,13 @@ def self_pli():
 
 
 def marker(uid, name, lat, lon, iconset_path, remarks, stale_hours=24):
-    """ATAK-format custom-icon marker (the format proven to survive an iTAK restart)."""
+    """Custom-icon marker, byte-for-byte the layout of the test package that kept its icon through an iTAK restart."""
     t = _now()
     return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             f'<event version="2.0" uid={quoteattr(uid)} type="a-u-G" how="h-g-i-g-o" time="{_iso(t)}" '
             f'start="{_iso(t)}" stale="{_iso(t + dt.timedelta(hours=stale_hours))}">'
             f'<point lat="{lat}" lon="{lon}" hae="9999999.0" ce="9999999.0" le="9999999.0"/>'
             f'<detail><status readiness="true"/><archive/>'
-            f'<link uid="{CLIENT_UID}" production_time="{_iso(t)}" type="a-f-G-E-S" '
-            f'parent_callsign={quoteattr(CALLSIGN)} relation="p-p"/>'
             f'<contact callsign={quoteattr(name)}/><remarks>{escape(remarks)}</remarks>'
             f'<archive/><color argb="-1"/><usericon iconsetpath={quoteattr(iconset_path)}/></detail></event>')
 
